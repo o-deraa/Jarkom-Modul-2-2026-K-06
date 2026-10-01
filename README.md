@@ -1783,7 +1783,880 @@ Baris `post-up` ditambahkan pada `/etc/network/interfaces` masing-masing node co
     post-up nohup sh /root/soal10.sh >/tmp/soal10.log 2>&1 &
 ```
 
+### Soal 11: Reverse Proxy (Penny → Vault, Abbey → Core)
+
+Pada soal ini, kedua gerbang dikonfigurasi sebagai reverse proxy yang mendistribusikan lalu lintas ke dua node backend di areanya masing-masing:
+- **Penny** (Apache) → area vault: obladi (`192.214.1.11`) dan desmond (`192.214.1.12`)
+- **Abbey** (Nginx) → area core: oblada (`192.214.1.21`) dan molly (`192.214.1.22`)
+
+Kedua gerbang meneruskan identitas asli pengunjung ke backend melalui forwarding header `Host` dan `X-Real-IP`. ServerName pada masing-masing gerbang disesuaikan dengan nama kanonik (`www.k06.com` untuk penny dan `static.k06.com` untuk abbey) agar selaras dengan konfigurasi redirect soal 13, di mana akses lewat `penny.k06.com` maupun IP akan diarahkan ke `www.k06.com`, dan akses lewat `abbey.k06.com` maupun IP akan diarahkan ke `static.k06.com`.
+
+---
+
+#### A. Penny sebagai Reverse Proxy ke Vault (Apache)
+
+###v# 1. Install Apache
+
+Paket `apache2-proxy` menyediakan modul `mod_proxy`, `mod_proxy_http`, dan `mod_proxy_balancer` yang dibutuhkan untuk reverse proxy dan load balancing.
+
+```sh
+# (dijalankan di penny)
+apk update
+apk add apache2 apache2-proxy
+```
+
+##### 2. Konfigurasi Reverse Proxy
+
+Dibuat konfigurasi virtual host dengan `ServerName www.k06.com` agar penny merespons permintaan yang sudah menggunakan nama kanonik. `ProxyPreserveHost On` memastikan header `Host` asli pengunjung diteruskan ke backend, sementara `RequestHeader set X-Real-IP` menambahkan header berisi IP asli pengunjung. Blok `balancer://vault` berisi dua `BalancerMember` (obladi dan desmond) sehingga permintaan disebar ke keduanya secara bergantian.
+
+```sh
+# (dijalankan di penny)
+cat > /etc/apache2/conf.d/proxy-vault.conf <<'EOF'
+LoadModule proxy_module modules/mod_proxy.so
+LoadModule proxy_http_module modules/mod_proxy_http.so
+LoadModule proxy_balancer_module modules/mod_proxy_balancer.so
+LoadModule lbmethod_byrequests_module modules/mod_lbmethod_byrequests.so
+LoadModule headers_module modules/mod_headers.so
+
+<VirtualHost *:80>
+    ServerName www.k06.com
+
+    ProxyPreserveHost On
+    RequestHeader set X-Real-IP expr=%{REMOTE_ADDR}
+
+    <Proxy "balancer://vault">
+        BalancerMember "http://192.214.1.11"
+        BalancerMember "http://192.214.1.12"
+    </Proxy>
+
+    ProxyPass        "/" "balancer://vault/"
+    ProxyPassReverse "/" "balancer://vault/"
+</VirtualHost>
+EOF
+```
+
+##### 3. Jalankan Apache
+
+```sh
+# (dijalankan di penny)
+httpd -t
+httpd
+```
+
+[SS - output httpd -t menampilkan Syntax OK]
+
+---
+
+#### B. Abbey sebagai Reverse Proxy ke Core (Nginx)
+
+##### 1. Install Nginx
+
+Nginx dipasang di abbey sebagai reverse proxy yang meneruskan request ke area core (oblada dan molly).
+
+```sh
+# (dijalankan di abbey)
+apk update
+apk add nginx
+```
+
+##### 2. Konfigurasi Reverse Proxy
+
+File default Nginx dihapus terlebih dahulu untuk menghindari konflik server block. `server_name` disetel ke `static.k06.com` sebagai nama kanonik abbey. Blok `upstream core` berisi dua server (oblada dan molly), Nginx menyebar permintaan ke keduanya secara round-robin. `proxy_set_header Host` meneruskan header `Host` asli pengunjung, dan `proxy_set_header X-Real-IP` menambahkan header berisi IP asli pengunjung.
+
+```sh
+# (dijalankan di abbey)
+rm -f /etc/nginx/http.d/default.conf
+
+cat > /etc/nginx/http.d/proxy-core.conf <<'EOF'
+upstream core {
+    server 192.214.1.21;
+    server 192.214.1.22;
+}
+
+server {
+    listen 80;
+    server_name static.k06.com;
+
+    location / {
+        proxy_pass http://core;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+}
+EOF
+```
+
+##### 3. Jalankan Nginx
+
+```sh
+# (dijalankan di abbey)
+nginx -t
+nginx
+```
+
+[SS - output nginx -t menampilkan configuration file test is successful]
+
+---
+
+#### C. Verifikasi
+
+Verifikasi dilakukan dari alpha menggunakan nama kanonik (`www.k06.com` dan `static.k06.com`) secara berulang untuk membuktikan distribusi lalu lintas ke dua backend masing-masing.
+
+```sh
+# (dijalankan di alpha)
+
+# Penny → vault (obladi/desmond)
+curl http://www.k06.com/
+curl http://www.k06.com/
+
+# Abbey → core (oblada/molly)
+curl http://static.k06.com/
+curl http://static.k06.com/
+curl http://static.k06.com/
+curl http://static.k06.com/
+```
+
+Hasil yang diharapkan:
+- `www.k06.com` mengembalikan halaman autoindex dari node vault berisi daftar file arsip. Baris `Server at www.k06.com Port 80` muncul karena `ProxyPreserveHost On` meneruskan header `Host: www.k06.com` ke backend.
+- `static.k06.com` mengembalikan halaman beranda core, dengan baris "Dilayani oleh:" menampilkan `oblada` dan `molly` secara bergantian pada permintaan berulang, membuktikan distribusi ke dua backend berhasil.
+
+[SS - curl berulang ke www.k06.com menampilkan konten vault bergantian dari obladi dan desmond]
+
+[SS - curl berulang ke static.k06.com menampilkan "Dilayani oleh: oblada" dan "Dilayani oleh: molly" bergantian]
+
+Untuk membuktikan forwarding `X-Real-IP` sampai ke backend, diperiksa access log di salah satu node backend. Log seharusnya mencatat IP asli klien (alpha: `192.214.4.2`), bukan IP gerbang (abbey: `192.214.2.2` atau penny: `192.214.3.2`).
+
+```sh
+# (dijalankan di oblada)
+tail -f /var/log/nginx/access.log
+```
+
+[SS - access log oblada menampilkan IP asli klien 192.214.4.2 bukan IP abbey 192.214.2.2]
+
+---
+
+#### Persistensi
+
+Seluruh langkah dibungkus dalam script `/root/soal11.sh` pada masing-masing node agar tetap aktif setelah restart. Script menunggu koneksi internet tersedia sebelum menjalankan `apk`, sehingga instalasi tidak gagal saat node baru saja menyala.
+
+##### Script penny
+
+```sh
+#!/bin/sh
+# /root/soal11.sh - penny (Apache reverse proxy -> vault)
+
+pgrep -x httpd >/dev/null 2>&1 && exit 0
+
+i=0
+while [ $i -lt 30 ]; do
+    ping -c1 -W1 192.168.122.1 >/dev/null 2>&1 && break
+    i=$((i+1))
+    sleep 1
+done
+
+apk update
+apk add apache2 apache2-proxy
+
+cat > /etc/apache2/conf.d/proxy-vault.conf <<'CONF'
+LoadModule proxy_module modules/mod_proxy.so
+LoadModule proxy_http_module modules/mod_proxy_http.so
+LoadModule proxy_balancer_module modules/mod_proxy_balancer.so
+LoadModule lbmethod_byrequests_module modules/mod_lbmethod_byrequests.so
+LoadModule headers_module modules/mod_headers.so
+
+<VirtualHost *:80>
+    ServerName www.k06.com
+
+    ProxyPreserveHost On
+    RequestHeader set X-Real-IP expr=%{REMOTE_ADDR}
+
+    <Proxy "balancer://vault">
+        BalancerMember "http://192.214.1.11"
+        BalancerMember "http://192.214.1.12"
+    </Proxy>
+
+    ProxyPass        "/" "balancer://vault/"
+    ProxyPassReverse "/" "balancer://vault/"
+</VirtualHost>
+CONF
+
+httpd
+```
+
+##### Script abbey
+
+```sh
+#!/bin/sh
+# /root/soal11.sh - abbey (Nginx reverse proxy -> core)
+
+pgrep -x nginx >/dev/null 2>&1 && exit 0
+
+i=0
+while [ $i -lt 30 ]; do
+    ping -c1 -W1 192.168.122.1 >/dev/null 2>&1 && break
+    i=$((i+1))
+    sleep 1
+done
+
+apk update
+apk add nginx
+
+rm -f /etc/nginx/http.d/default.conf
+cat > /etc/nginx/http.d/proxy-core.conf <<'CONF'
+upstream core {
+    server 192.214.1.21;
+    server 192.214.1.22;
+}
+
+server {
+    listen 80;
+    server_name static.k06.com;
+
+    location / {
+        proxy_pass http://core;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+}
+CONF
+
+nginx
+```
+
+Script dipanggil otomatis saat interface aktif dengan menambahkan baris `post-up` pada `/etc/network/interfaces` masing-masing node:
+
+```
+post-up sh /root/soal11.sh
+```
 
 
 
+### 12 - Basic Authentication pada Path `/admin`
 
+Pada soal ini diterapkan perlindungan Basic Authentication pada path `/admin` di node `penny`. Direktori tersebut digunakan untuk menyimpan dokumen rahasia, sehingga pengunjung tanpa kredensial harus ditolak dan hanya pengguna dengan kredensial yang ditentukan yang dapat mengaksesnya.
+
+Kredensial yang digunakan:
+
+- Username: `prabs`
+- Password: `pakar_pinter_jadi_gob***`
+
+Konfigurasi dilakukan di node `penny` yang menggunakan Apache sebagai reverse proxy.
+
+#### 1 - Instalasi Tools Apache
+
+Paket `apache2-utils` menyediakan command `htpasswd` untuk membuat file kredensial Basic Authentication.
+
+```bash
+# (dijalankan di penny)
+apk update
+apk add apache2 apache2-proxy apache2-utils
+```
+
+#### 2 - Membuat Direktori dan File Rahasia
+
+Dibuat direktori lokal `/var/www/admin` yang tidak diteruskan ke backend vault. Direktori ini berisi dokumen rahasia yang hanya dapat diakses setelah autentikasi berhasil.
+
+```bash
+# (dijalankan di penny)
+mkdir -p /var/www/admin
+echo "Dokumen rahasia sindikat The Mesh" > /var/www/admin/rahasia.txt
+
+cat > /var/www/admin/index.html <<'EOF'
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Ruang Rahasia The Mesh</title>
+</head>
+<body>
+    <h1>Dokumen Rahasia Sindikat The Mesh</h1>
+    <p>Akses berhasil menggunakan Basic Authentication.</p>
+</body>
+</html>
+EOF
+```
+
+#### 3 - Membuat File Kredensial
+
+File `.htpasswd` dibuat dengan user `prabs`. Password disimpan dalam bentuk hash oleh `htpasswd`, bukan sebagai teks biasa di dalam file kredensial.
+
+```bash
+# (dijalankan di penny)
+htpasswd -bc /etc/apache2/.htpasswd prabs 'pakar_pinter_jadi_gob***'
+chown root:apache /etc/apache2/.htpasswd
+chmod 640 /etc/apache2/.htpasswd
+```
+
+#### 4 - Konfigurasi Apache
+
+Konfigurasi `/admin` ditambahkan ke virtual host Apache yang sudah digunakan sebagai reverse proxy ke area vault. `ProxyPass "/admin" "!"` diletakkan sebelum `ProxyPass "/"` agar request `/admin` tidak diteruskan ke backend, melainkan dilayani secara lokal oleh penny.
+
+```bash
+# (dijalankan di penny)
+cat > /etc/apache2/conf.d/proxy-vault.conf <<'EOF'
+<VirtualHost *:80>
+    ServerName penny.k06.com
+
+    ProxyPreserveHost On
+    RequestHeader set X-Real-IP expr=%{REMOTE_ADDR}
+
+    # /admin dilayani lokal oleh penny, bukan diteruskan ke backend.
+    ProxyPass "/admin" "!"
+    Alias "/admin" "/var/www/admin"
+
+    <Directory "/var/www/admin">
+        Options -Indexes
+        AllowOverride None
+        AuthType Basic
+        AuthName "Ruang Rahasia The Mesh"
+        AuthUserFile "/etc/apache2/.htpasswd"
+        Require valid-user
+    </Directory>
+
+    <Proxy "balancer://vault">
+        BalancerMember "http://192.214.1.11"
+        BalancerMember "http://192.214.1.12"
+    </Proxy>
+
+    ProxyPass        "/" "balancer://vault/"
+    ProxyPassReverse "/" "balancer://vault/"
+</VirtualHost>
+EOF
+```
+
+#### 5 - Validasi dan Menjalankan Apache
+
+Konfigurasi divalidasi terlebih dahulu, kemudian proses Apache dimulai ulang agar konfigurasi Basic Authentication terbaca.
+
+```bash
+# (dijalankan di penny)
+httpd -t
+pkill -9 httpd 2>/dev/null
+sleep 1
+httpd
+```
+
+Hasil yang diharapkan dari `httpd -t` adalah `Syntax OK`.
+
+![alt text](image-64.png)
+
+#### Verifikasi
+
+Dijalankan dari klien, misalnya `alpha`, menggunakan hostname penny.
+
+Pertama, akses `/admin` tanpa kredensial:
+
+```bash
+# (dijalankan di klien, contoh: alpha)
+curl -i http://penny.k06.com/admin/
+```
+
+Hasil yang diharapkan:
+
+```text
+HTTP/1.1 401 Unauthorized
+```
+
+Respons `401 Unauthorized` membuktikan bahwa pengunjung tanpa kredensial ditolak. Karena konfigurasi menggunakan `Options -Indexes`, file `index.html` diperlukan agar path `/admin/` dapat menampilkan halaman setelah autentikasi berhasil.
+
+![alt text](image-65.png)
+
+Selanjutnya, akses `/admin` dengan kredensial yang benar:
+
+```bash
+# (dijalankan di klien, contoh: alpha)
+curl -i -u 'prabs:pakar_pinter_jadi_gob***' http://penny.k06.com/admin/
+```
+
+Hasil yang diharapkan adalah `HTTP/1.1 200 OK` disertai halaman `index.html` yang menampilkan judul `Dokumen Rahasia Sindikat The Mesh`. Hal ini membuktikan bahwa autentikasi berhasil dan akses ke path `/admin/` diizinkan.
+
+![alt text](image-66.png)
+
+Sebagai pemeriksaan tambahan, kredensial yang salah harus tetap ditolak:
+
+```bash
+# (dijalankan di klien, contoh: alpha)
+curl -i -u 'prabs:password-salah' http://penny.k06.com/admin/
+```
+
+Hasil yang diharapkan adalah `HTTP/1.1 401 Unauthorized`.
+
+![alt text](image-67.png)
+
+#### Persistensi
+
+Karena paket, file kredensial, direktori `/admin`, dan konfigurasi Apache dapat hilang ketika node docker di-restart, seluruh konfigurasi soal 12 dibungkus dalam script `/root/soal12.sh` di node `penny`.
+
+Script berikut menyiapkan Apache, membuat file kredensial, membuat dokumen rahasia, menulis ulang konfigurasi reverse proxy Penny beserta pengecualian `/admin`, kemudian me-restart Apache agar konfigurasi aktif.
+
+```sh
+#!/bin/sh
+# /root/soal12.sh - penny (
+
+i=0
+while [ $i -lt 30 ]; do
+    ping -c1 -W1 192.168.122.1 >/dev/null 2>&1 && break
+    i=$((i + 1))
+    sleep 1
+done
+
+# Instal Apache dan tools yang diperlukan jika belum tersedia.
+if ! apk info -e apache2 >/dev/null 2>&1 || \
+   ! apk info -e apache2-proxy >/dev/null 2>&1 || \
+   ! apk info -e apache2-utils >/dev/null 2>&1; then
+    apk update
+    apk add apache2 apache2-proxy apache2-utils
+fi
+
+mkdir -p /etc/apache2/conf.d /var/log/apache2 /var/www/admin
+
+echo "Dokumen rahasia sindikat The Mesh" > /var/www/admin/rahasia.txt
+
+cat > /var/www/admin/index.html <<'EOF'
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Ruang Rahasia The Mesh</title>
+</head>
+<body>
+    <h1>Dokumen Rahasia Sindikat The Mesh</h1>
+    <p>Akses berhasil menggunakan Basic Authentication.</p>
+</body>
+</html>
+EOF
+
+# Buat atau perbarui kredensial Basic Authentication.
+htpasswd -bc /etc/apache2/.htpasswd prabs 'pakar_pinter_jadi_gob***'
+chown root:apache /etc/apache2/.htpasswd
+chmod 640 /etc/apache2/.htpasswd
+
+# Konfigurasi reverse proxy + pengecualian /admin.
+cat > /etc/apache2/conf.d/proxy-vault.conf <<'EOF'
+<VirtualHost *:80>
+    ServerName penny.k06.com
+
+    ProxyPreserveHost On
+    RequestHeader set X-Real-IP expr=%{REMOTE_ADDR}
+
+    ProxyPass "/admin" "!"
+    Alias "/admin" "/var/www/admin"
+
+    <Directory "/var/www/admin">
+        Options -Indexes
+        AllowOverride None
+        AuthType Basic
+        AuthName "Ruang Rahasia The Mesh"
+        AuthUserFile "/etc/apache2/.htpasswd"
+        Require valid-user
+    </Directory>
+
+    <Proxy "balancer://vault">
+        BalancerMember "http://192.214.1.11"
+        BalancerMember "http://192.214.1.12"
+    </Proxy>
+
+    ProxyPass        "/" "balancer://vault/"
+    ProxyPassReverse "/" "balancer://vault/"
+</VirtualHost>
+EOF
+
+# Terapkan konfigurasi terbaru.
+httpd -t || exit 1
+pkill -9 httpd 2>/dev/null
+sleep 1
+httpd
+```
+
+Script startup `/root/init.sh` pada node `penny` menjalankan konfigurasi soal 11 dan soal 12 secara berurutan. Soal 12 dijalankan setelah soal 11 selesai karena script soal 12 menulis ulang `proxy-vault.conf` dengan pengecualian lokal untuk `/admin`.
+
+```sh
+#!/bin/sh
+
+sh /root/soal11.sh >/tmp/soal11.log 2>&1
+status11=$?
+
+sh /root/soal12.sh >/tmp/soal12.log 2>&1
+status12=$?
+
+[ "$status11" -eq 0 ] && [ "$status12" -eq 0 ]
+```
+
+Pemanggilan otomatis dilakukan oleh `/etc/alpinet-init.sh`, yang menjalankan `/root/init.sh` jika file tersebut ada dan memiliki permission executable:
+
+```sh
+[ -f /root/init.sh ] && [ -x /root/init.sh ] && /root/init.sh
+```
+
+Oleh karena itu, seluruh script dibuat executable dan hanya resolver yang ditulis pada `/etc/network/interfaces`:
+
+```bash
+# (dijalankan di penny)
+chmod +x /root/init.sh
+chmod +x /root/soal11.sh
+chmod +x /root/soal12.sh
+```
+
+### Soal 13: Redirect Kanonik
+
+Pada soal ini, setiap entitas yang mengakses gerbang menggunakan nama non-kanonik (IP atau hostname langsung) harus dipaksa diarahkan ke nama kanonik yang benar. Aturan yang berlaku:
+
+- Akses ke IP penny (`192.214.3.2`) atau `penny.k06.com` → redirect **permanen (301)** ke `www.k06.com`
+- Akses ke IP abbey (`192.214.2.2`) atau `abbey.k06.com` → redirect **sementara (302)** ke `static.k06.com`
+
+---
+
+#### A. Penny
+
+##### 1. Konfigurasi Redirect
+
+Ditambahkan VirtualHost khusus pada penny untuk menangkap akses lewat IP (`192.214.3.2`) dan hostname (`penny.k06.com`), kemudian mengarahkannya secara permanen ke `www.k06.com`. VirtualHost proxy soal 11 sudah menggunakan `ServerName www.k06.com`, sehingga kedua VirtualHost tidak bentrok — redirect menangkap akses non-kanonik, proxy melayani akses kanonik.
+
+```sh
+# (dijalankan di penny)
+cat > /etc/apache2/conf.d/redirect-penny.conf <<'EOF'
+<VirtualHost *:80>
+    ServerName 192.214.3.2
+    ServerAlias penny.k06.com
+    Redirect permanent / http://www.k06.com/
+</VirtualHost>
+EOF
+```
+
+##### 2. Validasi dan Restart Apache
+
+Konfigurasi divalidasi terlebih dahulu, kemudian Apache di-restart agar VirtualHost redirect aktif berdampingan dengan VirtualHost proxy.
+
+```sh
+# (dijalankan di penny)
+httpd -t
+pkill -9 httpd 2>/dev/null
+sleep 1
+httpd
+```
+
+![alt text](image-74.png)
+
+#### B. Abbey 
+
+##### 1. Konfigurasi Redirect
+
+Ditambahkan server block khusus pada abbey untuk menangkap akses lewat IP (`192.214.2.2`) dan hostname (`abbey.k06.com`), kemudian mengarahkannya sementara ke `static.k06.com`. Server block proxy soal 11 sudah menggunakan `server_name static.k06.com`, sehingga kedua server block tidak bentrok.
+
+```sh
+# (dijalankan di abbey)
+cat > /etc/nginx/http.d/redirect-abbey.conf <<'EOF'
+server {
+    listen 80;
+    server_name 192.214.2.2 abbey.k06.com;
+    return 302 http://static.k06.com/;
+}
+EOF
+```
+
+##### 2. Validasi dan Reload Nginx
+
+```sh
+# (dijalankan di abbey)
+nginx -t
+nginx -s reload 2>/dev/null || nginx
+```
+
+![alt text](image-75.png)
+
+
+#### Verifikasi
+
+Verifikasi dilakukan dari alpha dengan mengakses keempat titik (IP dan hostname masing-masing gerbang) untuk membuktikan status code redirect yang benar.
+
+```sh
+# (dijalankan di alpha)
+curl -i http://192.214.3.2/
+curl -i http://penny.k06.com/
+curl -i http://192.214.2.2/
+curl -i http://abbey.k06.com/
+```
+
+Hasil yang diharapkan:
+- `192.214.3.2` dan `penny.k06.com` mengembalikan `301 Moved Permanently` dengan `Location: http://www.k06.com/`
+- `192.214.2.2` dan `abbey.k06.com` mengembalikan `302 Moved Temporarily` dengan `Location: http://static.k06.com/`
+
+![alt text](image-76.png)
+
+![alt text](image-77.png)
+
+
+#### Persistensi
+
+Konfigurasi redirect dibungkus dalam script `/root/soal13.sh` pada masing-masing node agar tetap aktif setelah restart. Script soal 13 dijalankan setelah soal 11 di `init.sh` karena soal 11 yang menjalankan httpd/nginx, sehingga soal 13 cukup menulis config redirect dan reload.
+
+##### Script penny
+
+```sh
+#!/bin/sh
+# /root/soal13.sh
+
+cat > /etc/apache2/conf.d/redirect-penny.conf <<'EOF'
+<VirtualHost *:80>
+    ServerName 192.214.3.2
+    ServerAlias penny.k06.com
+    Redirect permanent / http://www.k06.com/
+</VirtualHost>
+EOF
+
+pkill -9 httpd 2>/dev/null
+sleep 1
+httpd
+```
+
+##### Script abbey
+
+```sh
+#!/bin/sh
+# /root/soal13.sh
+
+cat > /etc/nginx/http.d/redirect-abbey.conf <<'EOF'
+server {
+    listen 80;
+    server_name 192.214.2.2 abbey.k06.com;
+    return 302 http://static.k06.com/;
+}
+EOF
+
+nginx -s reload 2>/dev/null || nginx
+```
+
+##### init.sh penny
+
+Script `init.sh` menjalankan soal 11, 12, dan 13 secara berurutan. Soal 13 dijalankan paling akhir agar config redirect tidak tertimpa oleh soal 11 yang menulis ulang `proxy-vault.conf`.
+
+```sh
+#!/bin/sh
+sh /root/soal11.sh >/tmp/soal11.log 2>&1
+sh /root/soal12.sh >/tmp/soal12.log 2>&1
+sh /root/soal13.sh >/tmp/soal13.log 2>&1
+```
+
+##### init.sh abbey
+
+```sh
+#!/bin/sh
+sh /root/soal11.sh >/tmp/soal11.log 2>&1
+sh /root/soal13.sh >/tmp/soal13.log 2>&1
+```
+
+Seluruh script dibuat executable:
+
+```sh
+# (dijalankan di penny)
+chmod +x /root/init.sh /root/soal11.sh /root/soal12.sh /root/soal13.sh
+
+# (dijalankan di abbey)
+chmod +x /root/init.sh /root/soal11.sh /root/soal13.sh
+```
+
+### 14 - Access Log dengan IP Asli Klien
+
+Pada soal ini dipastikan bahwa access log pada seluruh backend web di area vault dan core mencatat alamat IP asli pengunjung, bukan alamat IP reverse proxy. Penny dan Abbey dari soal 11 sudah meneruskan header `X-Real-IP`, sehingga backend dikonfigurasi untuk menggunakan header tersebut saat menulis access log.
+
+Tujuannya agar rekam jejak akses tetap akurat. Jika klien `alpha` dengan IP `192.214.4.2` mengakses layanan melalui Penny atau Abbey, backend harus mencatat `192.214.4.2`, bukan IP Penny `192.214.3.2` atau IP Abbey `192.214.2.2`.
+
+#### 1 - Konfigurasi Backend Vault (Apache)
+
+Dijalankan pada node `obladi` dan `desmond`. Apache dikonfigurasi menggunakan modul `mod_remoteip`, sehingga nilai `X-Real-IP` dari reverse proxy digunakan sebagai alamat klien pada access log. IP reverse proxy yang dipercaya adalah Penny (`192.214.3.2`).
+
+```bash
+# (dijalankan di obladi dan desmond)
+cat > /etc/apache2/conf.d/real-ip.conf <<'EOF'
+LoadModule remoteip_module modules/mod_remoteip.so
+
+RemoteIPHeader X-Real-IP
+RemoteIPTrustedProxy 192.214.3.2
+
+LogFormat "%a - %u %t \"%r\" %>s %b \"%{Referer}i\" \"%{User-Agent}i\"" realip
+EOF
+
+sed -i 's#CustomLog /var/log/apache2/access.log combined#CustomLog /var/log/apache2/access.log realip#' \
+/etc/apache2/conf.d/vault.conf
+
+httpd -t
+pkill -9 httpd 2>/dev/null
+sleep 1
+httpd
+```
+
+Pada Apache, `mod_remoteip` memproses nilai `X-Real-IP`, lalu `LogFormat realip` menggunakan `%a` agar alamat klien hasil pemrosesan tersebut dicatat sebagai IP pertama pada access log.
+
+[SS hasil httpd -t dan proses httpd di obladi atau desmond]
+
+#### 2 - Konfigurasi Backend Core (Nginx)
+
+Dijalankan pada node `oblada` dan `molly`. Nginx menggunakan variabel `$http_x_real_ip` untuk menulis alamat IP asli dari header yang diteruskan Abbey (`192.214.2.2`).
+
+Pada konfigurasi server block core, ditambahkan format log dan `access_log` berikut:
+
+```bash
+# (dijalankan di oblada dan molly)
+cat > /etc/nginx/http.d/00-real-ip-log.conf <<'EOF'
+log_format realip '$http_x_real_ip - $remote_addr - $remote_user [$time_local] "$request" '
+                  '$status $body_bytes_sent "$http_referer" '
+                  '"$http_user_agent"';
+EOF
+```
+
+Kemudian pada `/etc/nginx/http.d/core.conf`, di dalam block `server`, ditambahkan:
+
+```nginx
+access_log /var/log/nginx/access.log realip;
+```
+
+Contoh posisi konfigurasinya:
+
+```nginx
+server {
+    listen 80;
+    server_name oblada.k06.com;
+    root /var/www/core;
+    index index.php;
+
+    access_log /var/log/nginx/access.log realip;
+
+    location / {
+        try_files $uri $uri/ @php;
+    }
+
+    location @php {
+        fastcgi_pass 127.0.0.1:9000;
+        include fastcgi.conf;
+        fastcgi_param SCRIPT_FILENAME $document_root$uri.php;
+    }
+
+    location ~ \.php$ {
+        fastcgi_pass 127.0.0.1:9000;
+        include fastcgi.conf;
+    }
+}
+```
+
+Pada `molly`, `server_name` disesuaikan menjadi `molly.k06.com`.
+
+Konfigurasi Nginx divalidasi dan dimuat ulang:
+
+```bash
+# (dijalankan di oblada dan molly)
+nginx -t
+nginx -s reload
+```
+
+[SS hasil nginx -t pada oblada atau molly]
+
+#### 3 - Menghasilkan Request dari Klien
+
+Sebelum memeriksa log, request dibuat dari klien `alpha` dengan IP `192.214.4.2`. Request dikirim melalui nama kanonik masing-masing gerbang:
+
+```bash
+# (dijalankan di alpha)
+curl http://www.k06.com/
+curl http://static.k06.com/
+```
+
+Request pertama melewati Penny menuju backend vault, sedangkan request kedua melewati Abbey menuju backend core.
+
+#### 4 - Memeriksa Access Log Backend
+
+Pada backend vault, log Apache diperiksa:
+
+```bash
+# (dijalankan di obladi atau desmond)
+tail -n 10 /var/log/apache2/access.log
+```
+
+Pada backend core, log Nginx diperiksa:
+
+```bash
+# (dijalankan di oblada atau molly)
+tail -n 10 /var/log/nginx/access.log
+```
+
+Hasil yang diharapkan: baris log Apache menampilkan `192.214.4.2` sebagai IP pertama. Pada log Nginx, format menampilkan `192.214.4.2` sebagai IP pertama dan IP reverse proxy (`192.214.2.2`) sebagai IP kedua. IP Penny (`192.214.3.2`) atau Abbey (`192.214.2.2`) tidak boleh menggantikan IP asli pada posisi pertama.
+
+[SS access log Apache di obladi/desmond yang menampilkan 192.214.4.2]
+
+[SS access log Nginx di oblada/molly yang menampilkan 192.214.4.2]
+
+#### Persistensi
+
+Agar konfigurasi access log tetap aktif setelah restart, konfigurasi dibungkus dalam `/root/soal14.sh` pada setiap backend. Script ini menulis konfigurasi `mod_remoteip` pada backend Apache, menambahkan format log `realip` pada backend Nginx, lalu memvalidasi dan me-restart service web.
+
+##### Script pada obladi dan desmond
+
+```sh
+#!/bin/sh
+# /root/soal14.sh - backend vault Apache
+
+mkdir -p /etc/apache2/conf.d /var/log/apache2
+
+cat > /etc/apache2/conf.d/real-ip.conf <<'EOF'
+LoadModule remoteip_module modules/mod_remoteip.so
+RemoteIPHeader X-Real-IP
+RemoteIPTrustedProxy 192.214.3.2
+
+LogFormat "%a - %u %t \"%r\" %>s %b \"%{Referer}i\" \"%{User-Agent}i\"" realip
+EOF
+
+sed -i 's#CustomLog /var/log/apache2/access.log combined#CustomLog /var/log/apache2/access.log realip#' \
+/etc/apache2/conf.d/vault.conf
+
+httpd -t || exit 1
+pkill -9 httpd 2>/dev/null
+sleep 1
+httpd
+```
+
+##### Script pada oblada dan molly
+
+```sh
+#!/bin/sh
+# /root/soal14.sh - backend core Nginx
+
+mkdir -p /etc/nginx/http.d /var/log/nginx
+
+cat > /etc/nginx/http.d/00-real-ip-log.conf <<'EOF'
+log_format realip '$http_x_real_ip - $remote_addr - $remote_user [$time_local] "$request" '
+                  '$status $body_bytes_sent "$http_referer" '
+                  '"$http_user_agent"';
+EOF
+
+# Tambahkan access_log ke server block core satu kali.
+if ! grep -q 'access_log /var/log/nginx/access.log realip;' /etc/nginx/http.d/core.conf; then
+    sed -i '/server_name /a\    access_log /var/log/nginx/access.log realip;' /etc/nginx/http.d/core.conf
+fi
+
+nginx -t || exit 1
+nginx -s reload 2>/dev/null || nginx
+```
+
+Pada setiap node, script dibuat executable:
+
+```bash
+# (dijalankan di obladi, desmond, oblada, dan molly)
+chmod +x /root/soal14.sh
+```
+
+Script kemudian dipanggil dari `/root/init.sh` setelah service web dari soal sebelumnya aktif. Contoh pada backend vault:
+
+```sh
+#!/bin/sh
+sh /root/soal9.sh >/tmp/soal9.log 2>&1
+sh /root/soal14.sh >/tmp/soal14.log 2>&1
+```
+
+Contoh pada backend core:
+
+```sh
+#!/bin/sh
+sh /root/soal10.sh >/tmp/soal10.log 2>&1
+sh /root/soal14.sh >/tmp/soal14.log 2>&1
+```
+
+Pemanggilan script tidak ditambahkan lagi ke `/etc/network/interfaces`; file tersebut hanya mengatur IP, gateway, dan resolver. Dengan demikian access log tetap memakai IP asli klien setelah node di-restart.

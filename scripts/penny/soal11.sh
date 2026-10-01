@@ -24,7 +24,7 @@ LoadModule headers_module modules/mod_headers.so
     ServerName penny.k06.com
 
     ProxyPreserveHost On
-    RequestHeader set X-Real-IP "%{REMOTE_ADDR}s"
+    RequestHeader set X-Real-IP expr=%{REMOTE_ADDR}
 
     <Proxy "balancer://vault">
         BalancerMember "http://192.214.1.11"
