@@ -1,0 +1,1 @@
+1. Ubah style nama node misal prabb jadi `prabb`, termasuk semua hal teknis yang berhubungan dengan kode dan jaringan, ip adress. lokasi file. 
