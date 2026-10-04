@@ -3784,3 +3784,305 @@ curl http://outbound.k06.com -H "Host: http.badssl.com"
 server mengembalikan konten halaman `http.badssl.com`. Hal ini menunjukkan perbedaan antara DNS CNAME resolution dan HTTP Host-based routing.
 
 Dengan demikian, CNAME berhasil melakukan binding pada level DNS, tetapi CNAME sendiri tidak mengubah nilai HTTP Host header.
+
+### 20 - Persistensi dan Autostart Seluruh Konfigurasi
+
+Pada soal terakhir ini dipastikan bahwa seluruh service dan konfigurasi yang telah dikerjakan dari soal 1 sampai soal 19 tetap berjalan normal dan berstatus autostart ketika node di-restart. Khusus untuk soal ini, konfigurasi nomor 18 (perubahan A record `abbey` ke IP fiktif dengan TTL 15 detik) diabaikan dan dikembalikan ke kondisi normal, karena soal 18 hanya bersifat pengujian caching sementara.
+
+
+#### Masalah Presistensi
+
+Image docker yang digunakan, `ardhptr21/alpinet:latest`, bersifat ephemeral:
+
+- Setiap kali node di-restart, seluruh paket yang diinstal lewat `apk` (bind, apache2, nginx, php84-fpm, dsb.) hilang dan kembali ke kondisi image awal.
+- Seluruh konfigurasi di luar direktori persisten (`/etc/bind`, `/etc/apache2`, `/etc/nginx`, `/var/www`, dsb.) ikut hilang.
+- Image tidak menyertakan OpenRC, sehingga mekanisme autostart standar Alpine (`rc-service` / `rc-update`) tidak tersedia.
+
+Oleh karena itu, pendekatannya bukan memakai cara pasang sekali lalu beres, melainkan membungkus setiap langkah instalasi dan konfigurasi soal ke dalam script di dalam `/root` (satu-satunya direktori yang bersifat persisten), lalu memanggilnya otomatis saat node boot.
+
+Dengan kata lain, persistensi dibuat untuk setiap soal, mulai dari topologi, NAT, DNS, web statis, web dinamis, reverse proxy, basic auth, redirect, access log, jalur khusus, sampai record DNS tambahan (TXT dan CNAME outbound). Tidak ada konfigurasi yang dibiarkan manual.
+
+#### Mekanisme Autostart
+
+Rangkaian script dijalankan otomatis lewat dua jalur:
+
+1. `/etc/alpinet-init.sh` menuju `/root/init.sh` (mekanisme utama pada image ini). File `/etc/alpinet-init.sh` memanggil `/root/init.sh` bila file tersebut ada dan executable:
+
+   ```sh
+   [ -f /root/init.sh ] && [ -x /root/init.sh ] && /root/init.sh
+   ```
+
+2. Baris `post-up` pada `/etc/network/interfaces` sebagai jalur kedua, dieksekusi `ifup` ketika antarmuka aktif:
+
+   ```
+   post-up nohup sh /root/soalN.sh >/tmp/soalN.log 2>&1 &
+   ```
+
+Setiap `/root/init.sh` pada dasarnya adalah orkestrator per-node yang memanggil script-soal secara berurutan (memakai `nohup ... &` agar boot tidak menggantung) dan mengatur urutan ketergantungan, misalnya soal 12 harus setelah soal 11, dan soal 13 setelah soal 11.
+
+Pola yang dipakai konsisten di seluruh script agar aman dijalankan berulang:
+
+- Guard `pgrep`: jika service sudah berjalan, script langsung `exit 0` sehingga tidak ada install/start ganda.
+- Loop tunggu dependensi: menunggu `soal4.sh` selesai membuat zona, menunggu named aktif, menunggu koneksi internet (ping `192.168.122.1`) siap sebelum `apk`.
+- Append bersyarat: record DNS hanya ditambah bila belum ada (`grep -q ... && exit 0`).
+- `chmod +x` pada seluruh script `/root/*.sh` dan `/root/init.sh`.
+
+#### Ringkasan Persistensi Seluruh Soal
+
+| Soal | Artefak yang dipulihkan | Script persistensi | Node |
+|---|---|---|---|
+| 1 | Alamat IP statis + gateway tiap entitas | konfigurasi `/etc/network/interfaces` | semua node |
+| 2 | IP forwarding + NAT MASQUERADE | `/root/nat.sh` | rootkit |
+| 3 | Resolver awal `192.168.122.1` | `post-up` tulis `/etc/resolv.conf` | semua non-router |
+| 4 | BIND9 master + slave zona `k06.com` | `/root/soal4.sh` | prab, tedd |
+| 5 | A record tiap node + serial SOA | `/root/soal5.sh` | prab |
+| 6 | Verifikasi zone transfer (tanpa konfigurasi) | - | prab, tedd |
+| 7 | A record `vault`/`core` + CNAME `www`/`static` | `/root/soal7.sh` | prab |
+| 8 | Tiga reverse zone + PTR | `/root/soal8.sh` | prab, tedd |
+| 9 | Apache autoindex `/arsip` | `/root/soal9.sh` | obladi, desmond |
+| 10 | nginx + php-fpm + clean URL `/profil` | `/root/soal10.sh` | oblada, molly |
+| 11 | Reverse proxy (penny ke vault, abbey ke core) | `/root/soal11.sh` | penny, abbey |
+| 12 | Basic auth `/admin` + kredensial | `/root/soal12.sh` | penny |
+| 13 | Redirect kanonik 301/302 | `/root/soal13.sh` | penny, abbey |
+| 14 | Access log memakai IP asli klien | `/root/soal14.sh` | obladi, desmond, oblada, molly |
+| 15 | Jalur khusus `/eternal` (PHP) dan `/orion` (statis) | `/root/soal15.sh` | penny, abbey |
+| 16 | ApacheBench (hanya pengujian, tidak ada service) | - | alpha |
+| 17 | TXT record client (alpha sampai epsilon) | `/root/soal17.sh` | prab |
+| 18 | Diabaikan atau direvert sesuai perintah soal | revert A record `abbey` | prab |
+| 19 | CNAME `outbound.k06.com` ke `http.badssl.com` | `/root/soal19.sh` | prab |
+
+Soal 6 dan soal 16 murni berupa verifikasi dan benchmark sehingga tidak memiliki service yang perlu di-autostart. Soal 17 dan 19 merupakan penambahan record DNS ke file zona `k06.com`, sehingga perlu ditulis ulang setiap boot sama seperti soal 5 dan 7.
+
+#### Rangkaian `init.sh` per Node
+
+Berikut `init.sh` tiap node yang memanggil script-soal secara berurutan. Urutannya penting karena tiap langkah bergantung pada langkah sebelumnya.
+
+prab (DNS master):
+
+```sh
+#!/bin/sh
+# /root/init.sh - prab
+nohup /root/soal4.sh  >/tmp/soal4.log  2>&1 &
+nohup /root/soal5.sh  >/tmp/soal5.log  2>&1 &
+nohup /root/soal7.sh  >/tmp/soal7.log  2>&1 &
+nohup /root/soal8.sh  >/tmp/soal8.log  2>&1 &
+nohup /root/soal17.sh >/tmp/soal17.log 2>&1 &
+nohup /root/soal19.sh >/tmp/soal19.log 2>&1 &
+```
+
+tedd (DNS slave):
+
+```sh
+#!/bin/sh
+# /root/init.sh - tedd
+nohup /root/soal4.sh >/tmp/soal4.log 2>&1 &
+nohup /root/soal8.sh >/tmp/soal8.log 2>&1 &
+```
+
+penny (reverse proxy Apache + auth + redirect + jalur khusus):
+
+```sh
+#!/bin/sh
+# /root/init.sh - penny
+nohup /root/soal11.sh >/tmp/soal11.log 2>&1 &
+nohup /root/soal12.sh >/tmp/soal12.log 2>&1 &
+nohup /root/soal13.sh >/tmp/soal13.log 2>&1 &
+nohup /root/soal15.sh >/tmp/soal15.log 2>&1 &
+```
+
+abbey (reverse proxy nginx + redirect + jalur khusus):
+
+```sh
+#!/bin/sh
+# /root/init.sh - abbey
+nohup /root/soal11.sh >/tmp/soal11.log 2>&1 &
+nohup /root/soal13.sh >/tmp/soal13.log 2>&1 &
+nohup /root/soal15.sh >/tmp/soal15.log 2>&1 &
+```
+
+obladi dan desmond (vault, web statis):
+
+```sh
+#!/bin/sh
+# /root/init.sh - obladi / desmond
+nohup /root/soal9.sh  >/tmp/soal9.log  2>&1 &
+nohup /root/soal14.sh >/tmp/soal14.log 2>&1 &
+```
+
+oblada dan molly (core, web dinamis):
+
+```sh
+#!/bin/sh
+# /root/init.sh - oblada / molly
+nohup /root/soal10.sh >/tmp/soal10.log 2>&1 &
+nohup /root/soal14.sh >/tmp/soal14.log 2>&1 &
+```
+
+rootkit (router, NAT):
+
+```sh
+#!/bin/sh
+# /root/init.sh - rootkit
+sh /root/nat.sh
+```
+
+Karena seluruh script harus executable saat boot:
+
+```bash
+# (dijalankan di tiap node)
+chmod +x /root/init.sh /root/soal*.sh
+```
+
+#### Persistensi Record DNS Tambahan (Soal 17 dan 19)
+
+Sama seperti soal 5 dan 7, record TXT (soal 17) dan CNAME `outbound` (soal 19) dituliskan ke `/etc/bind/zones/k06.com.db`, sehingga harus ditulis ulang setiap boot karena file zona di-generate ulang oleh `soal4.sh`. Polanya dibuat identik: tunggu named siap, idempoten, tambah record, naikkan serial, lalu reload.
+
+`/root/soal17.sh` pada prab (TXT record client):
+
+```sh
+#!/bin/sh
+# /root/soal17.sh - prab (TXT record alpha..epsilon)
+
+ZONE=/etc/bind/zones/k06.com.db
+
+# Tunggu zona dasar dari soal5/soal7 siap.
+i=0
+while [ $i -lt 120 ]; do
+    [ -f "$ZONE" ] && grep -q '^vault' "$ZONE" && pgrep -x named >/dev/null 2>&1 && break
+    i=$((i+1))
+    sleep 1
+done
+
+# Idempoten: kalau TXT alpha sudah ada, berhenti.
+grep -q '^alpha.*TXT' "$ZONE" && exit 0
+
+cat >> "$ZONE" <<'EOF'
+
+alpha           IN      TXT     "alpha"
+beta            IN      TXT     "beta"
+gamma           IN      TXT     "gamma"
+delta           IN      TXT     "delta"
+epsilon         IN      TXT     "epsilon"
+EOF
+
+# Naikkan serial agar tedd menarik ulang salinan zona.
+sed -i 's/[0-9]\{10\} ; Serial/2026100417 ; Serial/' "$ZONE"
+
+chown named:named "$ZONE"
+rndc reload k06.com 2>/dev/null || { pkill named; named -c /etc/bind/named.conf -u named; }
+```
+
+`/root/soal19.sh` pada prab (CNAME outbound):
+
+```sh
+#!/bin/sh
+# /root/soal19.sh - prab (CNAME outbound.k06.com -> http.badssl.com)
+
+ZONE=/etc/bind/zones/k06.com.db
+
+i=0
+while [ $i -lt 120 ]; do
+    [ -f "$ZONE" ] && grep -q '^alpha.*TXT' "$ZONE" && pgrep -x named >/dev/null 2>&1 && break
+    i=$((i+1))
+    sleep 1
+done
+
+grep -q '^outbound' "$ZONE" && exit 0
+
+cat >> "$ZONE" <<'EOF'
+
+outbound        IN      CNAME   http.badssl.com.
+EOF
+
+sed -i 's/[0-9]\{10\} ; Serial/2026100419 ; Serial/' "$ZONE"
+
+chown named:named "$ZONE"
+rndc reload k06.com 2>/dev/null || { pkill named; named -c /etc/bind/named.conf -u named; }
+```
+
+Dengan kedua script ini, TXT record dan CNAME `outbound` ikut pulih setelah prab restart, sejajar dengan record DNS lain dari soal 5 dan 7.
+
+#### Mengembalikan Kondisi Normal (Konfigurasi Nomor 18)
+
+Sesuai perintah soal, konfigurasi nomor 18 (A record `abbey` diubah ke IP fiktif `192.214.2.99` dengan TTL 15 detik) tidak dipersistensi, melainkan dikembalikan ke kondisi semula:
+
+- A record `abbey.k06.com` dikembalikan ke IP asli `192.214.2.2`.
+- TTL 15 detik dihapus, kembali ke `$TTL` default zona.
+- Serial SOA dinaikkan terakhir agar tedd ikut menyinkronkan kondisi normal.
+
+Karena file zona selalu di-generate ulang dari `soal4.sh`, `soal5.sh`, dan `soal7.sh`, kondisi default setelah boot sudah otomatis normal (abbey = `192.214.2.2`, tanpa TTL 15). Yang perlu dipastikan hanyalah bahwa script soal 18 tidak ikut dipanggil di `/root/init.sh`.
+
+Verifikasi bahwa DNS sudah kembali normal:
+
+```bash
+# (dijalankan di prab)
+dig @127.0.0.1 abbey.k06.com A +noall +answer
+# (dijalankan di tedd)
+dig @127.0.0.1 abbey.k06.com A +noall +answer
+```
+
+Hasil yang diharapkan: keduanya mengembalikan `192.214.2.2` (bukan `192.214.2.99`), membuktikan koordinat atau keadaan telah kembali normal.
+
+#### Verifikasi Setelah Seluruh Node Di-restart
+
+Seluruh node di-restart terlebih dahulu, lalu dilakukan pemeriksaan end-to-end tanpa intervensi manual.
+
+1. DNS (prab dan tedd):
+
+```bash
+# (dijalankan di prab)
+pgrep -x named
+dig @127.0.0.1 k06.com +short
+dig @127.0.0.1 alpha.k06.com TXT +short
+dig @127.0.0.1 outbound.k06.com CNAME +short
+ls -la /var/bind/slave/        # di tedd: bukti zona tersalin ulang
+
+# (dijalankan di tedd)
+pgrep -x named
+dig @127.0.0.1 alpha.k06.com +short
+```
+
+Hasil yang diharapkan: named berjalan di kedua node, record inti (apex, hostname, TXT, CNAME outbound) terjawab, dan salinan zona di tedd terbarui.
+
+2. Web statis (vault) dan web dinamis (core):
+
+```bash
+# (dijalankan di obladi / desmond)
+pgrep -x httpd
+# (dijalankan di oblada / molly)
+pgrep -x nginx
+pgrep -x php-fpm84
+```
+
+Hasil yang diharapkan: `httpd`, `nginx`, dan `php-fpm84` kembali berjalan otomatis.
+
+3. Reverse proxy, basic auth, redirect, access log, dan jalur khusus (dari alpha):
+
+```bash
+# (dijalankan di klien, contoh: alpha)
+curl -I http://www.k06.com/                 # proxy penny ke vault
+curl -I http://static.k06.com/              # proxy abbey ke core
+curl -i http://penny.k06.com/admin/         # 401 tanpa kredensial
+curl -i -u 'prabs:pakar_pinter_jadi_gob***' http://penny.k06.com/admin/   # 200
+curl -i http://192.214.3.2/                 # 301 ke www.k06.com
+curl -i http://abbey.k06.com/               # 302 ke static.k06.com
+curl http://penny.k06.com/eternal/          # PHP /eternal
+curl http://static.k06.com/orion/           # statis /orion
+```
+
+Hasil yang diharapkan: seluruh gerbang, proteksi `/admin`, redirect kanonik, dan jalur khusus berfungsi kembali setelah restart.
+
+4. Access log mencatat IP asli klien (bukan IP gerbang):
+
+```bash
+# (dijalankan di obladi / desmond)
+tail -n 5 /var/log/apache2/access.log
+# (dijalankan di oblada / molly)
+tail -n 5 /var/log/nginx/access.log
+```
+
+Hasil yang diharapkan: kolom IP menampilkan IP asli client (alpha), bukan `192.214.3.2` (penny) atau `192.214.2.2` (abbey).
+
+#### Kesimpulan
+
+Seluruh konfigurasi dari soal 1 hingga soal 19 sudah dibungkus dalam script `/root/soal*.sh` dan dipanggil otomatis via `/root/init.sh`, sehingga setiap node mengembalikan dirinya sendiri ke kondisi siap pakai setelah restart. Dengan demikian tidak ada lagi langkah konfigurasi manual yang tertinggal, setiap service berstatus autostart, dan khusus konfigurasi nomor 18 keadaan DNS telah dikembalikan normal sesuai instruksi soal.
